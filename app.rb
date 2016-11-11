@@ -1,72 +1,66 @@
 require 'rack/parser'
 require 'sinatra'
 require 'json'
-require 'faraday'
+require 'slack-notifier'
+require 'awesome_print'
+require 'octokit'
+require 'buildkit'
+require 'yaml'
 
 # Required
-set :lifx_access_token, ENV['LIFX_ACCESS_TOKEN'] || raise("no LIFX_ACCESS_TOKEN set")
-set :bulb_selector,     ENV['BULB_SELECTOR']     || raise("no BULB_SELECTOR set")
-set :webhook_token,     ENV['WEBHOOK_TOKEN']     || raise("no WEBHOOK_TOKEN set")
+set :webhook_token, ENV['WEBHOOK_TOKEN'] || raise("no WEBHOOK_TOKEN set")
+set :slack_webhook_url, ENV['SLACK_WEBHOOK_URL'] || raise("no SLACK_WEBHOOK_URL set")
+set :github_api_key, ENV['GITHUB_API_KEY'] || raise("no GITHUB_API_KEY set")
+set :builkit_api_key, ENV['BUILDKIT_API_KEY'] || raise("no BUILDKIT_API_KEY set")
 
-# Optional
-set :lifx_api_host, ENV['LIFX_ENDPOINT'] || 'api.lifx.com'
 
 use Rack::Parser # loads the JSON request body into params
 
-helpers do
-  def lifx_api
-    Faraday.new(url: "https://#{settings.lifx_api_host}") do |faraday|
-      faraday.authorization :Bearer, settings.lifx_access_token
-      faraday.request :url_encoded
-      # faraday.response :logger
-      faraday.adapter Faraday.default_adapter
-      faraday.use Faraday::Response::RaiseError
-    end
-  end
-end
+# Without some really wonky API calls and some guesswork, its very hard to get these
+github_to_slackname_mapping = YAML.load_file(['config','github_slack_user_mapping.yml'].join("/"))
 
-post "/" do
-  halt 401 unless request.env['HTTP_X_BUILDKITE_TOKEN'] == settings.webhook_token
+notifier = Slack::Notifier.new settings.slack_webhook_url
+github_client = Octokit::Client.new :access_token =>  settings.github_api_key
+buildkit = Buildkit.new(token: settings.builkit_api_key)
 
-  puts params.inspect # helpful for inspecting incoming webhook requests
-
+post "/buildkite" do
   buildkite_event = request.env['HTTP_X_BUILDKITE_EVENT']
 
-  if buildkite_event == 'build.running'
-    lifx_api.post "/v1/lights/#{settings.bulb_selector}/effects/breathe.json",
-      power_on:   false,
-      color:      "yellow brightness:5%",
-      from_color: "yellow brightness:35%",
-      period:     5,
-      cycles:     9999,
-      persist:    true
-  end
+  halt 401 unless request.env['HTTP_X_BUILDKITE_TOKEN'] == settings.webhook_token
 
-  if buildkite_event == 'build.finished'
-    if params['build']['state'] == 'passed'
-      lifx_api.post "/v1/lights/#{settings.bulb_selector}/effects/breathe.json",
-        power_on:   false,
-        color:      "green brightness:75%",
-        from_color: "green brightness:10%",
-        period:     0.45,
-        cycles:     3,
-        persist:    true,
-        peak:       0.2
+  ap params
+
+  build = params[:build]
+
+  slack_formatted_buildkite_url = slack_formatted_url(build[:web_url], "here")
+
+  pull_request_id = build.dig(:pull_request, :id)
+
+  # TODO: Generify this
+  pr = github_client.pull_request "bugcrowd/bugcrowd", pull_request_id # This is a Sawyer object, not a hash
+
+  pull_request_url, pull_request_branch, github_author = pr[:html_url], pr[:head][:ref], pr[:user][:login]
+
+  slack_formatted_github_url = slack_formatted_url(pull_request_url, "#{pull_request_branch} (#{pull_request_id})")
+
+  slackname = github_to_slackname_mapping[github_author]
+
+  case buildkite_event
+  when 'build.finished'
+    if params.dig(:build, :state) == 'passed'
+      notifier.ping ":thumbsup: :thumbsup: Build passed for #{slack_formatted_github_url}, find the status #{slack_formatted_buildkite_url}"
     else
-      lifx_api.post "/v1/lights/#{settings.bulb_selector}/effects/breathe.json",
-        power_on:   false,
-        color:      "red brightness:60%",
-        from_color: "red brightness:25%",
-        period:     0.1,
-        cycles:     20,
-        persist:    true,
-        peak:       0.2
+      notifier.ping ":thumbsdown: :thumbsdown: :fire: :fire: Build failed for #{slack_formatted_github_url}, find the status #{slack_formatted_buildkite_url}"
     end
+  when 'build.scheduled'
+    notifier.ping ":building_construction: :building_construction: Build started for #{slack_formatted_github_url}, find the status #{slack_formatted_buildkite_url}"
+  else
+    ap "Unhandled event: #{buildkite_event}"
   end
 
   status 200
 end
 
-get "/" do
-  "<div style=\"font:24px Avenir,Helvetica;max-width:32em;margin:2em;line-height:1.3\"><h1 style=\"font-size:1.5em\">Huzzah! You’re almost there.</h1><p style=\"color:#666\">Now create a webhook in your <a href=\"https://buildkite.com/\" style=\"color:black\">Buildkite</a> notification settings with this URL, and the webhook token from the Heroku app’s config&nbsp;variables.</p><p>#{request.scheme}://#{request.host}/</p></div>"
+def slack_formatted_url(url, display_text)
+  "<#{url}|#{display_text}>"
 end
