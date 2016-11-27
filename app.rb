@@ -34,6 +34,12 @@ post "/buildkite" do
 
   slack_formatted_buildkite_url = slack_formatted_url(build[:web_url], "here")
 
+  begin
+    if params.dig(:build, :state) == 'passed' && params.dig(:build, :branch) == 'master'
+      notifier.ping ":thumbsup: :thumbsup: Build passed on master, :shipit: that shizz. Find the build #{slack_formatted_buildkite_url}"
+  rescue
+    ap build
+
   pull_request_id = build.dig(:pull_request, :id)
 
   # TODO: Generify this
@@ -44,6 +50,8 @@ post "/buildkite" do
   slack_formatted_github_url = slack_formatted_url(pull_request_url, "#{pull_request_branch} (#{pull_request_id})")
 
   slackname = github_to_slackname_mapping[github_author]
+
+  #TODO: Reenable this : notifier.channel = "@#{slackname}"
 
   case buildkite_event
   when 'build.finished'
